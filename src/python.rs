@@ -814,6 +814,7 @@ pub fn hnsw_based_dendrogram<'py>(
 			hnsw_params,
 		);
 		result.0.iter_mut().for_each(|(_,_,d,_)| *d = d.max(0.0).sqrt());
+		result.1.iter_mut().for_each(|d| *d = d.max(0.0).sqrt());
 		result
 	}
 }
@@ -866,6 +867,7 @@ pub fn hnsw_based_dendrogram_self_joined<'py>(
 			query_local.unwrap_or(false),
 		);
 		result.0.iter_mut().for_each(|(_,_,d,_)| *d = d.max(0.0).sqrt());
+		result.1.iter_mut().for_each(|d| *d = d.max(0.0).sqrt());
 		result
 	}
 }
