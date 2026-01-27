@@ -1,5 +1,5 @@
 use foldhash::HashSet;
-use graphidx::{data::MatrixDataSource, graphs::{Graph, WeightedGraph}, heaps::MinHeap, measures::Distance, types::{SyncFloat, SyncUnsignedInteger}};
+use graphidx::{data::MatrixDataSource, graphs::{Graph, WeightedGraph}, heaps::MinHeap, indices::{GraphIndex, GreedyLayeredGraphIndex, GreedySingleGraphIndex}, measures::Distance, types::{SyncFloat, SyncUnsignedInteger}};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::hnsw::{HNSWParallelHeapBuilder, HNSWParams, HNSWStyleBuilder};
@@ -63,7 +63,7 @@ impl<R: SyncUnsignedInteger> UnionFind<R> {
 	}
 }
 
-pub fn graph_based_dendrogram<
+pub fn hnsw_based_dendrogram<
 	F: SyncFloat,
 	R: SyncUnsignedInteger,
 	M: MatrixDataSource<F>+graphidx::types::Sync,
@@ -74,6 +74,49 @@ pub fn graph_based_dendrogram<
 	/* Build HNSW on the data and get the graphs */
 	let hnsw = HNSWParallelHeapBuilder::<R,_,_>::base_init(data, dist, hnsw_params);
 	let (graphs, _, global_ids, dist) = hnsw._into_parts();
+	/* Call generic function */
+	graph_based_dendrogram(data, graphs, global_ids, dist, min_pts, expand, symmetric_expand)
+}
+
+pub fn hnsw_based_dendrogram_self_joined<
+	F: SyncFloat,
+	R: SyncUnsignedInteger,
+	M: MatrixDataSource<F>+graphidx::types::Sync,
+	Dist: Distance<F>+Sync+Send,
+	>(data: &M, dist: Dist, min_pts: usize, expand: bool, symmetric_expand: bool, hnsw_params: HNSWParams<F>, query_max_heap_size: usize, query_local: bool) -> (Vec<(usize, usize, F, usize)>, Vec<F>) {
+	let n = data.n_rows();
+	assert!(R::max_value().to_usize().unwrap() >= n);
+	/* Build HNSW on the data and get the graphs */
+	let hnsw = HNSWParallelHeapBuilder::<R,_,_>::base_init(data, dist, hnsw_params);
+	let (mut graphs, local_ids, global_ids, dist) = hnsw._into_parts();
+	let graphs = if query_local {
+		let index = GreedySingleGraphIndex::new(data, graphs.remove(0), dist.clone(), None);
+		let self_join = index.self_join_query_local(min_pts, query_max_heap_size);
+		let mut new_graphs: Vec<_> = Vec::new();
+		new_graphs.push(self_join);
+		graphs.into_iter().for_each(|g| new_graphs.push(g.as_weighted_dir_lol_graph()));
+		new_graphs
+	} else {
+		let index = GreedyLayeredGraphIndex::new(data, graphs, local_ids, global_ids.clone(), dist.clone(), 1, None);
+		let self_join = index.self_join_query(min_pts, query_max_heap_size);
+		let mut new_graphs: Vec<_> = Vec::new();
+		new_graphs.push(self_join);
+		index.graphs()[1..].into_iter().for_each(|g| new_graphs.push(g.as_weighted_dir_lol_graph()));
+		new_graphs
+	};
+	/* Call generic function */
+	graph_based_dendrogram(data, graphs, global_ids, dist, min_pts, expand, symmetric_expand)
+}
+
+pub fn graph_based_dendrogram<
+	F: SyncFloat,
+	R: SyncUnsignedInteger,
+	M: MatrixDataSource<F>+graphidx::types::Sync,
+	Dist: Distance<F>+Sync+Send,
+	G: WeightedGraph<R,F>,
+>(data: &M, graphs: Vec<G>, global_ids: Vec<Vec<R>>, dist: Dist, min_pts: usize, expand: bool, symmetric_expand: bool) -> (Vec<(usize, usize, F, usize)>, Vec<F>) {
+	let n = data.n_rows();
+	assert!(R::max_value().to_usize().unwrap() >= n);
 	/* Create storage for observed edges and accessor function */
 	let mut observed_edges = ObservedEdgesStore::new(n);
 	/* Create an expand queue for edges and insert all edges from all graph levels */
@@ -163,16 +206,18 @@ pub fn graph_based_dendrogram<
 					/* Attempt to merge with all neighbors first */
 					let neighbor_stack = neighbor_stacks.get_unchecked_mut(idx_usize);
 					while neighbor_stack.size() > 0 {
-						let (distance,other) = neighbor_stack.pop().unwrap_unchecked();
-						if *neighbor_counts.get_unchecked(other.to_usize().unwrap_unchecked()) >= min_pts {
+						let (_distance,other) = neighbor_stack.pop().unwrap_unchecked();
+						let other_usize = other.to_usize().unwrap_unchecked();
+						if *neighbor_counts.get_unchecked(other_usize) >= min_pts {
 							let other_root = union_find.find(other).to_usize().unwrap_unchecked();
+							/* The core distance of this point should be larger than all distances seen so far, so just use d_ij. */
 							if root != other_root {
 								merge_clusters(
 									&mut dendrogram,
 									&mut union_find,
 									&mut cluster_ids,
 									&mut cluster_sizes,
-									distance, other_root, root
+									d_ij, other_root, root
 								);
 							}
 						}
@@ -194,6 +239,7 @@ pub fn graph_based_dendrogram<
 					&mut union_find,
 					&mut cluster_ids,
 					&mut cluster_sizes,
+					/* When i and j are core-points, d_ij should be smaller than the core distance, so no need to take any max */
 					d_ij, i_root, j_root
 				);
 			}
@@ -300,20 +346,21 @@ mod tests {
 	use ndarray_rand::rand_distr::Normal;
 	use rand::prelude::Distribution;
 
-	use crate::{cluster::graph_based_dendrogram, hnsw::HNSWParams};
+	use crate::{cluster::{hnsw_based_dendrogram, hnsw_based_dendrogram_self_joined}, hnsw::HNSWParams};
 
 	#[test]
-	fn test_graph_based_dendrogram() {
+	fn test_hnsw_based_dendrogram() {
 		let (n,d) = (10_000, 3);
 		let rng1 = Normal::new(0.0, 1.0).unwrap();
 		let rng2 = Normal::new(5.0, 1.0).unwrap();
 		let data: Array2<f32> = Array2::from_shape_fn((n, d), |(i,_)| (if i%2 == 0 {rng1} else {rng2}).sample(&mut rand::thread_rng()));
 		let start_time = std::time::Instant::now();
-		let (dendrogram, core_distances) = graph_based_dendrogram::<f32, u32, _, _>(
+		let (dendrogram, core_distances) = hnsw_based_dendrogram::<f32, u32, _, _>(
 			&data,
 			graphidx::measures::SquaredEuclideanDistance::new(),
 			5,
 			true,
+			false,
 			HNSWParams::new(),
 		);
 		println!("Dendrogram computation took: {:.2?}", start_time.elapsed());
@@ -324,6 +371,35 @@ mod tests {
 		let std_core_dist = core_distances.iter().map(|&x| (x - mean_core_dist).powi(2)).sum::<f32>() / core_distances.len() as f32;
 		println!("Mean core distance: {}", mean_core_dist);
 		println!("Std core distance: {}", std_core_dist);
+	}
+
+	#[test]
+	fn test_hnsw_based_dendrogram_self_joined() {
+		let (n,d) = (10_000, 3);
+		let rng1 = Normal::new(0.0, 1.0).unwrap();
+		let rng2 = Normal::new(5.0, 1.0).unwrap();
+		let data: Array2<f32> = Array2::from_shape_fn((n, d), |(i,_)| (if i%2 == 0 {rng1} else {rng2}).sample(&mut rand::thread_rng()));
+		for query_local in [false, true] {
+			let start_time = std::time::Instant::now();
+			let (dendrogram, core_distances) = hnsw_based_dendrogram_self_joined::<f32, u32, _, _>(
+				&data,
+				graphidx::measures::SquaredEuclideanDistance::new(),
+				5,
+				true,
+				false,
+				HNSWParams::new(),
+				25,
+				query_local,
+			);
+			println!("Dendrogram computation took: {:.2?}", start_time.elapsed());
+			dendrogram.iter().skip(n-10).for_each(|v| {
+				println!("{} {} {} {}", v.0, v.1, v.2, v.3);
+			});
+			let mean_core_dist = core_distances.iter().sum::<f32>() / core_distances.len() as f32;
+			let std_core_dist = core_distances.iter().map(|&x| (x - mean_core_dist).powi(2)).sum::<f32>() / core_distances.len() as f32;
+			println!("Mean core distance: {}", mean_core_dist);
+			println!("Std core distance: {}", std_core_dist);
+		}
 	}
 }
 

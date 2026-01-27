@@ -772,7 +772,7 @@ pub fn load_hnswlib_fat(file: &str, max_frontier_size: Option<usize>) -> OwningP
 
 #[pyfunction]
 #[pyo3(signature = (data, min_pts, expand=None, symmetric_expand=None, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None))]
-pub fn graph_based_dendrogram<'py>(
+pub fn hnsw_based_dendrogram<'py>(
 	data: Bound<'py, PyArray2<f32>>,
 	min_pts: usize,
 	expand: Option<bool>,
@@ -805,14 +805,68 @@ pub fn graph_based_dendrogram<'py>(
 	.maybe_with_n_rounds(n_rounds)
 	;
 	unsafe {
-		crate::cluster::graph_based_dendrogram::<f32,usize,_,_>(
+		let mut result = crate::cluster::hnsw_based_dendrogram::<f32,usize,_,_>(
 			&arrview2_py_to_rust(data.as_array()),
 			SquaredEuclideanDistance::new(),
 			min_pts,
 			expand.unwrap_or(true),
 			symmetric_expand.unwrap_or(false),
 			hnsw_params,
-		)
+		);
+		result.0.iter_mut().for_each(|(_,_,d,_)| *d = d.max(0.0).sqrt());
+		result
+	}
+}
+
+#[pyfunction]
+#[pyo3(signature = (data, min_pts, query_max_heap_size, expand=None, symmetric_expand=None, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, query_local=false))]
+pub fn hnsw_based_dendrogram_self_joined<'py>(
+	data: Bound<'py, PyArray2<f32>>,
+	min_pts: usize,
+	query_max_heap_size: usize,
+	expand: Option<bool>,
+	symmetric_expand: Option<bool>,
+	higher_max_degree: Option<usize>,
+	lowest_max_degree: Option<usize>,
+	max_layers: Option<usize>,
+	n_parallel_burnin: Option<usize>,
+	max_build_heap_size: Option<usize>,
+	max_build_frontier_size: Option<usize>,
+	level_norm_param_override: Option<f32>,
+	insert_heuristic: Option<bool>,
+	insert_heuristic_extend: Option<bool>,
+	post_prune_heuristic: Option<bool>,
+	insert_minibatch_size: Option<usize>,
+	n_rounds: Option<usize>,
+	query_local: Option<bool>,
+) -> (Vec<(usize, usize, f32, usize)>, Vec<f32>) {
+	let hnsw_params = HNSWParams::new()
+	.maybe_with_higher_max_degree(higher_max_degree)
+	.maybe_with_lowest_max_degree(lowest_max_degree)
+	.maybe_with_max_layers(max_layers)
+	.maybe_with_n_parallel_burnin(n_parallel_burnin)
+	.maybe_with_max_build_heap_size(max_build_heap_size)
+	.with_max_build_frontier_size(max_build_frontier_size)
+	.with_level_norm_param_override(level_norm_param_override)
+	.maybe_with_insert_heuristic(insert_heuristic)
+	.maybe_with_insert_heuristic_extend(insert_heuristic_extend)
+	.maybe_with_post_prune_heuristic(post_prune_heuristic)
+	.maybe_with_insert_minibatch_size(insert_minibatch_size)
+	.maybe_with_n_rounds(n_rounds)
+	;
+	unsafe {
+		let mut result = crate::cluster::hnsw_based_dendrogram_self_joined::<f32,usize,_,_>(
+			&arrview2_py_to_rust(data.as_array()),
+			SquaredEuclideanDistance::new(),
+			min_pts,
+			expand.unwrap_or(true),
+			symmetric_expand.unwrap_or(false),
+			hnsw_params,
+			query_max_heap_size,
+			query_local.unwrap_or(false),
+		);
+		result.0.iter_mut().for_each(|(_,_,d,_)| *d = d.max(0.0).sqrt());
+		result
 	}
 }
 
@@ -827,7 +881,8 @@ fn hnsw(m: &Bound<'_, PyModule>) -> PyResult<()> {
 	m.add_class::<PySENDescent>()?;
 	m.add_function(wrap_pyfunction!(load_hnswlib, m)?)?;
 	m.add_function(wrap_pyfunction!(load_hnswlib_fat, m)?)?;
-	m.add_function(wrap_pyfunction!(graph_based_dendrogram, m)?)?;
+	m.add_function(wrap_pyfunction!(hnsw_based_dendrogram, m)?)?;
+	m.add_function(wrap_pyfunction!(hnsw_based_dendrogram_self_joined, m)?)?;
 	Ok(())
 }
 
