@@ -83,7 +83,7 @@ pub fn hnsw_based_dendrogram_self_joined<
 	R: SyncUnsignedInteger,
 	M: MatrixDataSource<F>+graphidx::types::Sync,
 	Dist: Distance<F>+Sync+Send,
-	>(data: &M, dist: Dist, min_pts: usize, expand: bool, symmetric_expand: bool, hnsw_params: HNSWParams<F>, query_max_heap_size: usize, query_local: bool) -> (Vec<(usize, usize, F, usize)>, Vec<F>) {
+	>(data: &M, dist: Dist, min_pts: usize, expand: bool, symmetric_expand: bool, hnsw_params: HNSWParams<F>, self_join_neighbors: usize, query_max_heap_size: usize, query_local: bool) -> (Vec<(usize, usize, F, usize)>, Vec<F>) {
 	let n = data.n_rows();
 	assert!(R::max_value().to_usize().unwrap() >= n);
 	/* Build HNSW on the data and get the graphs */
@@ -91,14 +91,14 @@ pub fn hnsw_based_dendrogram_self_joined<
 	let (mut graphs, local_ids, global_ids, dist) = hnsw._into_parts();
 	let graphs = if query_local {
 		let index = GreedySingleGraphIndex::new(data, graphs.remove(0), dist.clone(), None);
-		let self_join = index.self_join_query_local(min_pts, query_max_heap_size);
+		let self_join = index.self_join_query_local(self_join_neighbors, query_max_heap_size);
 		let mut new_graphs: Vec<_> = Vec::new();
 		new_graphs.push(self_join);
 		graphs.into_iter().for_each(|g| new_graphs.push(g.as_weighted_dir_lol_graph()));
 		new_graphs
 	} else {
 		let index = GreedyLayeredGraphIndex::new(data, graphs, local_ids, global_ids.clone(), dist.clone(), 1, None);
-		let self_join = index.self_join_query(min_pts, query_max_heap_size);
+		let self_join = index.self_join_query(self_join_neighbors, query_max_heap_size);
 		let mut new_graphs: Vec<_> = Vec::new();
 		new_graphs.push(self_join);
 		index.graphs()[1..].into_iter().for_each(|g| new_graphs.push(g.as_weighted_dir_lol_graph()));
@@ -388,6 +388,7 @@ mod tests {
 				true,
 				false,
 				HNSWParams::new(),
+				100,
 				25,
 				query_local,
 			);

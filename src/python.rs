@@ -820,10 +820,11 @@ pub fn hnsw_based_dendrogram<'py>(
 }
 
 #[pyfunction]
-#[pyo3(signature = (data, min_pts, query_max_heap_size, expand=None, symmetric_expand=None, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, query_local=false))]
+#[pyo3(signature = (data, min_pts, self_join_neighbors, query_max_heap_size, expand=None, symmetric_expand=None, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, query_local=false))]
 pub fn hnsw_based_dendrogram_self_joined<'py>(
 	data: Bound<'py, PyArray2<f32>>,
 	min_pts: usize,
+	self_join_neighbors: usize,
 	query_max_heap_size: usize,
 	expand: Option<bool>,
 	symmetric_expand: Option<bool>,
@@ -863,6 +864,7 @@ pub fn hnsw_based_dendrogram_self_joined<'py>(
 			expand.unwrap_or(true),
 			symmetric_expand.unwrap_or(false),
 			hnsw_params,
+			self_join_neighbors,
 			query_max_heap_size,
 			query_local.unwrap_or(false),
 		);
