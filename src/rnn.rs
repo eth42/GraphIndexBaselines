@@ -527,11 +527,11 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> RNNDesce
 					old_neighbors.clear();
 					with_guard!(self, uusize, {
 						old_neighbors.extend(self.graph.get_adj(u));
-						(*unsafe_rev_cache_ref).get_unchecked_mut(uusize).extend(self.graph.get_adj(u));
+						(&mut *unsafe_rev_cache_ref).get_unchecked_mut(uusize).extend(self.graph.get_adj(u));
 					});
 					old_neighbors.iter().for_each(|&(dist, v, _)| {
 						let vusize = R::to_usize(&v).unwrap_unchecked();
-						with_guard!(self, vusize, (*unsafe_rev_cache_ref).get_unchecked_mut(vusize).push((dist,u,true)));
+						with_guard!(self, vusize, (&mut *unsafe_rev_cache_ref).get_unchecked_mut(vusize).push((dist,u,true)));
 					});
 				})
 			});
@@ -543,7 +543,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> RNNDesce
 				let unsafe_rev_cache_ref = std::ptr::addr_of!(self.rev_edge_cache) as *mut Vec<Vec<(F,R,bool)>>;
 				(start..end).map(|uusize| {
 					let u = R::from_usize(uusize).unwrap_unchecked();
-					let joined_neighbors = (*unsafe_rev_cache_ref).get_unchecked_mut(uusize);
+					let joined_neighbors = (&mut *unsafe_rev_cache_ref).get_unchecked_mut(uusize);
 					/* Sorting such that: */
 					/* - Closer neighbors are first */
 					/* - Smaller IDs of equally far neighbors are first */
@@ -795,8 +795,8 @@ pub fn bruteforce_rng_edges<F: SyncFloat, M: MatrixDataSource<F>+Sync>(data: &M)
 				let q = data.get_row_view(j);
 				let dist = dist.dist_slice(&p, &q);
 				unsafe {
-					(*unsafe_dist_mat_ref)[[i,j]] = dist;
-					(*unsafe_dist_mat_ref)[[j,i]] = dist;
+					(&mut *unsafe_dist_mat_ref)[[i,j]] = dist;
+					(&mut *unsafe_dist_mat_ref)[[j,i]] = dist;
 				}
 			});
 		});
@@ -972,11 +972,11 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> SENDesce
 					with_guard!(self, uusize, {
 						let adj = self.graph.get_adj(u);
 						old_neighbors.extend(adj);
-						(*unsafe_rev_cache_ref).get_unchecked_mut(uusize).extend(adj);
+						(&mut *unsafe_rev_cache_ref).get_unchecked_mut(uusize).extend(adj);
 					});
 					old_neighbors.iter().for_each(|&(dist, v, _)| {
 						let vusize = R::to_usize(&v).unwrap_unchecked();
-						with_guard!(self, vusize, (*unsafe_rev_cache_ref).get_unchecked_mut(vusize).push((dist,u,true)));
+						with_guard!(self, vusize, (&mut *unsafe_rev_cache_ref).get_unchecked_mut(vusize).push((dist,u,true)));
 					});
 				})
 			});
@@ -988,7 +988,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> SENDesce
 				let unsafe_rev_cache_ref = std::ptr::addr_of!(self.rev_edge_cache) as *mut Vec<Vec<(F,R,bool)>>;
 				(start..end).map(|uusize| {
 					let u = R::from_usize(uusize).unwrap_unchecked();
-					let joined_neighbors = (*unsafe_rev_cache_ref).get_unchecked_mut(uusize);
+					let joined_neighbors = (&mut *unsafe_rev_cache_ref).get_unchecked_mut(uusize);
 					/* Sorting such that: */
 					/* - Closer neighbors are first */
 					/* - Smaller IDs of equally far neighbors are first */
@@ -1307,8 +1307,8 @@ pub fn bruteforce_sen_edges<F: SyncFloat, M: MatrixDataSource<F>+Sync>(data: &M,
 				let q = data.get_row_view(j);
 				let dist = dist.dist_slice(&p, &q);
 				unsafe {
-					(*unsafe_dist_mat_ref)[[i,j]] = dist;
-					(*unsafe_dist_mat_ref)[[j,i]] = dist;
+					(&mut *unsafe_dist_mat_ref)[[i,j]] = dist;
+					(&mut *unsafe_dist_mat_ref)[[j,i]] = dist;
 				}
 			});
 		});

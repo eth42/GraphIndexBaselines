@@ -1343,7 +1343,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 						if level >= curr_level {
 							local_ids[curr_layer_offset] = next_layer_offset;
 							global_ids[curr_layer_offset] = R::from_usize(i).unwrap_unchecked();
-							if level == curr_level { (*unsafe_point_level_pos)[i] = curr_layer_offset; }
+							if level == curr_level { (&mut *unsafe_point_level_pos)[i] = curr_layer_offset; }
 							curr_layer_offset += 1;
 						}
 						/* Point i requires an entry in the lookups of the next layer */
@@ -2006,7 +2006,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 						if level >= curr_level {
 							local_ids[curr_layer_offset] = next_layer_offset;
 							global_ids[curr_layer_offset] = R::from_usize(i).unwrap_unchecked();
-							if level == curr_level { (*unsafe_point_level_pos)[i] = curr_layer_offset; }
+							if level == curr_level { (&mut *unsafe_point_level_pos)[i] = curr_layer_offset; }
 							curr_layer_offset += 1;
 						}
 						/* Point i requires an entry in the lookups of the next layer */
@@ -2457,7 +2457,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 						if level >= curr_level {
 							local_ids[curr_layer_offset] = next_layer_offset;
 							global_ids[curr_layer_offset] = R::from_usize(i).unwrap_unchecked();
-							if level == curr_level { (*unsafe_point_level_pos)[i] = curr_layer_offset; }
+							if level == curr_level { (&mut *unsafe_point_level_pos)[i] = curr_layer_offset; }
 							curr_layer_offset += 1;
 						}
 						/* Point i requires an entry in the lookups of the next layer */
@@ -2788,7 +2788,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 						if level >= curr_level {
 							local_ids[curr_layer_offset] = next_layer_offset;
 							global_ids[curr_layer_offset] = R::from_usize(i).unwrap_unchecked();
-							if level == curr_level { (*unsafe_point_level_pos)[i] = curr_layer_offset; }
+							if level == curr_level { (&mut *unsafe_point_level_pos)[i] = curr_layer_offset; }
 							curr_layer_offset += 1;
 						}
 						/* Point i requires an entry in the lookups of the next layer */
@@ -2990,7 +2990,7 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 			unsafe {
 				let (i_layer, i, _, _) = edges_chunk[0];
 				let max_degree = if i_layer==0 { (*unsafe_self_ref).params.lowest_max_degree } else { (*unsafe_self_ref).params.higher_max_degree };
-				let adj = (*unsafe_self_ref).graphs[i_layer].view_neighbors_heap_mut(i);
+				let adj = (&mut (*unsafe_self_ref).graphs)[i_layer].view_neighbors_heap_mut(i);
 				Self::add_reverse_edges_single(adj, &mut edges_chunk.iter(), max_degree);
 			}
 		});
