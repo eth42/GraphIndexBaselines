@@ -688,8 +688,8 @@ pub mod single_threaded {
 					if self.params.insert_heuristic_extend {
 						heuristic_hashset.clear();
 						candidates.iter().for_each(|&(_,j)| _=heuristic_hashset.insert(j));
-						(0..neighbors.len()).for_each(|i_neighbor| {
-							(*graph).view_neighbors(R::from_usize(i_neighbor).unwrap_unchecked()).iter().for_each(|&(_,j)| {
+						neighbors.iter().for_each(|&(_,i_neighbor)| {
+							(*graph).view_neighbors(i_neighbor).iter().for_each(|&(_,j)| {
 								if heuristic_hashset.insert(j) {
 									let j_global = if layer>0 { self.global_layer_ids[layer-1][j.to_usize().unwrap_unchecked()] } else { j };
 									candidates.push((self._get_dist(mat, i_global, j_global.to_usize().unwrap_unchecked()), j));
@@ -890,8 +890,8 @@ pub mod single_threaded {
 					if self.params.insert_heuristic_extend {
 						heuristic_hashset.clear();
 						candidates.iter().for_each(|&(_,j)| _=heuristic_hashset.insert(j));
-						(0..neighbors.len()).for_each(|i_neighbor| {
-							(*graph).view_neighbors(R::from_usize(i_neighbor).unwrap_unchecked()).iter().for_each(|&(_,j)| {
+						neighbors.iter().for_each(|&(_,i_neighbor)| {
+							(*graph).view_neighbors(i_neighbor).iter().for_each(|&(_,j)| {
 								if heuristic_hashset.insert(j) {
 									let j_global = if layer>0 { self.global_layer_ids[layer-1][j.to_usize().unwrap_unchecked()] } else { j };
 									candidates.push((self._get_dist(mat, i_global, j_global.to_usize().unwrap_unchecked()), j));
@@ -1114,8 +1114,8 @@ pub mod single_threaded {
 					if self.params.insert_heuristic_extend {
 						heuristic_hashset.clear();
 						candidates.iter().for_each(|&(_,j)| _=heuristic_hashset.insert(j));
-						(0..neighbors.len()).for_each(|i_neighbor| {
-							(*graph).view_neighbors(R::from_usize(i_neighbor).unwrap_unchecked()).iter().for_each(|&(_,j)| {
+						neighbors.iter().for_each(|&(_,i_neighbor)| {
+							(*graph).view_neighbors(i_neighbor).iter().for_each(|&(_,j)| {
 								if heuristic_hashset.insert(j) {
 									let j_global = if layer>0 { self.global_layer_ids[layer-1][j.to_usize().unwrap_unchecked()] } else { j };
 									candidates.push((self._get_dist(mat, i_global, j_global.to_usize().unwrap_unchecked()), j));
@@ -1494,8 +1494,8 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 				if self.params.insert_heuristic_extend {
 					heuristic_hashset.clear();
 					candidates.iter().for_each(|&(_,j)| _=heuristic_hashset.insert(j));
-					(0..neighbors.len()).for_each(|i_neighbor| {
-						(*graph).view_neighbors(R::from_usize(i_neighbor).unwrap_unchecked()).iter().for_each(|&(_,j)| {
+					neighbors.iter().for_each(|&(_,i_neighbor)| {
+						(*graph).view_neighbors(i_neighbor).iter().for_each(|&(_,j)| {
 							if heuristic_hashset.insert(j) {
 								let j_global = if layer>0 { self.global_layer_ids[layer-1][j.to_usize().unwrap_unchecked()] } else { j };
 								candidates.push((self._get_dist(mat, i_global, j_global.to_usize().unwrap_unchecked()), j));
@@ -2157,8 +2157,8 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 				if self.params.insert_heuristic_extend {
 					heuristic_hashset.clear();
 					candidates.iter().for_each(|&(_,j)| _=heuristic_hashset.insert(j));
-					(0..neighbors.len()).for_each(|i_neighbor| {
-						(*graph).view_neighbors(R::from_usize(i_neighbor).unwrap_unchecked()).iter().for_each(|&(_,j)| {
+					neighbors.iter().for_each(|&(_,i_neighbor)| {
+						(*graph).view_neighbors(i_neighbor).iter().for_each(|&(_,j)| {
 							if heuristic_hashset.insert(j) {
 								let j_global = if layer>0 { self.global_layer_ids[layer-1][j.to_usize().unwrap_unchecked()] } else { j };
 								candidates.push((self._get_dist(mat, i_global, j_global.to_usize().unwrap_unchecked()), j));
@@ -2583,8 +2583,8 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 				if self.params.insert_heuristic_extend {
 					heuristic_hashset.clear();
 					candidates.iter().for_each(|&(_,j)| _=heuristic_hashset.insert(j));
-					(0..neighbors.len()).for_each(|i_neighbor| {
-						(*graph).view_neighbors(R::from_usize(i_neighbor).unwrap_unchecked()).iter().for_each(|&(_,j)| {
+					neighbors.iter().for_each(|&(_,i_neighbor)| {
+						(*graph).view_neighbors(i_neighbor).iter().for_each(|&(_,j)| {
 							if heuristic_hashset.insert(j) {
 								let j_global = if layer>0 { self.global_layer_ids[layer-1][j.to_usize().unwrap_unchecked()] } else { j };
 								candidates.push((self._get_dist(mat, i_global, j_global.to_usize().unwrap_unchecked()), j));
@@ -2915,8 +2915,8 @@ impl<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<F>+Sync+Send> HNSWPara
 				if self.params.insert_heuristic_extend {
 					heuristic_hashset.clear();
 					candidates.iter().for_each(|&(_,j)| _=heuristic_hashset.insert(j));
-					(0..neighbors.len()).for_each(|i_neighbor| {
-						(*graph).view_neighbors(R::from_usize(i_neighbor).unwrap_unchecked()).iter().for_each(|&(_,j)| {
+					neighbors.iter().for_each(|&(_,i_neighbor)| {
+						(*graph).view_neighbors(i_neighbor).iter().for_each(|&(_,j)| {
 							if heuristic_hashset.insert(j) {
 								let j_global = if layer>0 { self.global_layer_ids[layer-1][j.to_usize().unwrap_unchecked()] } else { j };
 								candidates.push((self._get_dist(mat, i_global, j_global.to_usize().unwrap_unchecked()), j));
