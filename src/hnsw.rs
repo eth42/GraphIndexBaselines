@@ -348,7 +348,7 @@ pub trait HNSWStyleBuilder<R: SyncUnsignedInteger, F: SyncFloat, Dist: Distance<
 				entry_points.into_iter().for_each(|&mut (d,i)| frontier_minheap.push(d,i));
 				let global_ids = if is_layer0 {None} else {Some(&self._global_layer_ids()[layer-1])};
 				while let Some((d, v)) = frontier_minheap.pop() {
-					if d > search_maxheap.peek().unwrap().0 { break; }
+					if search_maxheap.size() >= max_heap_size && d > search_maxheap.peek().unwrap().0 { break; }
 					for &(_,j) in graph.view_neighbors(v) {
 						if visited_set.insert(j) {
 							let j_global = unsafe{(if is_layer0 { j } else { global_ids.unwrap_unchecked()[j.to_usize().unwrap_unchecked()] }).to_usize().unwrap_unchecked()};
