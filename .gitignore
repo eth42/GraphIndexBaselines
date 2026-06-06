@@ -4,6 +4,7 @@ target
 lib
 pyenv
 data
+_*
 
 *.sh
 flamegraph.svg

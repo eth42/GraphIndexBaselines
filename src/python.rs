@@ -4,10 +4,91 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use numpy::{PyArray1, PyArray2, PyArrayMethods};
-use graphidx::{graphs::{DirLoLGraph, FatDirGraph, Graph}, indices::{GraphIndex, GreedyCappedLayeredGraphIndex, GreedyCappedSingleGraphIndex, GreedyLayeredGraphIndex, GreedySingleGraphIndex}, measures::SquaredEuclideanDistance, types::UnsignedInteger, graph_ops::{extend_random_edges, fill_random_edges}};
+use graphidx::{data::{MatrixDataSource, InterleavedSparseMatrix, TransmuteInto}, graph_ops::{extend_random_edges, fill_random_edges}, graphs::{DirLoLGraph, FatDirGraph, Graph, WDirLoLGraph, WeightedGraph}, indices::{GraphIndex, GreedyCappedLayeredGraphIndex, GreedyCappedSingleGraphIndex, GreedyLayeredGraphIndex, GreedySingleGraphIndex}, measures::Distance, types::{SyncFloat, UnsignedInteger}};
+#[allow(unused)]
+use num::traits::ConstZero;
+use num::NumCast;
 use pyo3::prelude::*;
+use paste::paste;
 
 use crate::{hnsw::{FloodingHNSWBuilder, FloodingHNSWSENBuilder, HNSWParallelHeapBuilder, HNSWParallelSENHeapBuilder, HNSWParams, HNSWSENParams, HNSWStyleBuilder}, rnn::{RNNStyleBuilder, SENParams}};
+
+/* Size of references (IDs) in wrapped indices */
+macro_rules! make_reference_types {
+	($utype: ty, $itype: ty, $bits: literal) => {
+		mod reference_types {
+			pub type PyUint = $utype;
+			pub type PyInt = $itype;
+			pub const REF_BITS: usize = $bits;
+		}
+	};
+	($($feature: literal: $bits: literal),*$(,)*) => {
+		paste! {
+			$(
+				#[cfg(feature=$feature)]
+				make_reference_types!([<u $bits>], [<i $bits>], $bits);
+			)*
+			#[cfg(not(any($(feature=$feature,)*)))]
+			#[cfg(target_pointer_width = "32")]
+			make_reference_types!(usize, isize, 32);
+			#[cfg(not(any($(feature=$feature,)*)))]
+			#[cfg(target_pointer_width = "64")]
+			make_reference_types!(usize, isize, 64);
+		}
+		type PyUint = reference_types::PyUint;
+		type PyInt = reference_types::PyInt;
+		const REF_BITS: usize = reference_types::REF_BITS;
+		#[pyfunction]
+		fn ref_bits() -> usize { REF_BITS }
+	};
+}
+make_reference_types!(
+	"pyref16": 16,
+	"pyref32": 32,
+	"pyref64": 64,
+	"pyref128": 128,
+);
+/* Numerical precision */
+#[allow(non_camel_case_types)]
+#[allow(unused)]
+type f16 = half::f16;
+macro_rules! make_precision_types {
+	($ftype: ty, $itype: ty, $utype: ty, $bits: literal) => {
+		mod precision_types {
+			pub type PyFloat = $ftype;
+			/* int and uint type with equivalent number of bytes to PyFloat for interleaved storage */
+			pub type PyFloatInt = $itype;
+			pub type PyFloatUint = $utype;
+			pub const PREC_BITS: usize = $bits;
+		}
+	};
+	($($feature: literal: ($ftype: path, $itype: ty, $utype: ty, $bits: literal)),*$(,)*) => {
+		paste! {
+			$(
+				#[cfg(feature=$feature)]
+				make_precision_types!($ftype, $itype, $utype, $bits);
+			)*
+			#[cfg(not(any($(feature=$feature,)*)))]
+			#[cfg(target_pointer_width = "32")]
+			make_precision_types!(f32, i32, u32, 32);
+			#[cfg(not(any($(feature=$feature,)*)))]
+			#[cfg(target_pointer_width = "64")]
+			make_precision_types!(f64, i64, u64, 64);
+		}
+		type PyFloat = precision_types::PyFloat;
+		type PyFloatInt = precision_types::PyFloatInt;
+		type PyFloatUint = precision_types::PyFloatUint;
+		const PREC_BITS: usize = precision_types::PREC_BITS;
+		#[pyfunction]
+		fn prec_bits() -> usize { PREC_BITS }
+	};
+}
+make_precision_types!(
+	"pyprec16": (half::f16, i16, u16, 16),
+	"pyprec32": (f32, i32, u32, 32),
+	"pyprec64": (f64, i64, u64, 64),
+	// "pyprec128": (f128, i128, u128, 128),
+);
 
 /* Conversion code to handle different ndarray versions in this crate and numpy dependencies */
 fn arr1_rust_to_py<T>(arr: Array1<T>) -> numpy::ndarray::Array1<T> {
@@ -68,35 +149,163 @@ impl GraphStats {
 }
 
 
-type GSIndex<M> = GreedySingleGraphIndex<usize, f32, SquaredEuclideanDistance<f32>, M, DirLoLGraph<usize>>;
-type GCSIndex<M> = GreedyCappedSingleGraphIndex<usize, f32, SquaredEuclideanDistance<f32>, M, DirLoLGraph<usize>>;
-// type FGSIndex<M> = GreedySingleGraphIndex<usize, f32, SquaredEuclideanDistance<f32>, M, FatDirGraph<usize>>;
-// type FGCSIndex<M> = GreedyCappedSingleGraphIndex<usize, f32, SquaredEuclideanDistance<f32>, M, FatDirGraph<usize>>;
-type GLIndex<M> = GreedyLayeredGraphIndex<usize, f32, SquaredEuclideanDistance<f32>, M, DirLoLGraph<usize>>;
-type GCLIndex<M> = GreedyCappedLayeredGraphIndex<usize, f32, SquaredEuclideanDistance<f32>, M, DirLoLGraph<usize>>;
-type FGLIndex<M> = GreedyLayeredGraphIndex<usize, f32, SquaredEuclideanDistance<f32>, M, FatDirGraph<usize>>;
-type FGCLIndex<M> = GreedyCappedLayeredGraphIndex<usize, f32, SquaredEuclideanDistance<f32>, M, FatDirGraph<usize>>;
+pub trait DistanceWrapper<F: SyncFloat+numpy::Element> {
+	type Dist: Distance<F>;
+	fn get_dist(&self) -> &Self::Dist;
+	fn dist<'py>(&self, u: Bound<'py, PyArray1<F>>, v: Bound<'py, PyArray1<F>>) -> F {
+		unsafe { self.get_dist().dist_slice(u.as_slice().unwrap(), v.as_slice().unwrap()) }
+	}
+	fn to_enum(self) -> DistanceEnum;
+}
+macro_rules! make_distance_wrapper {
+	(normal $name: ident $(($($arg: ident),*$(,)?))?) => {
+		paste! {
+			#[derive(Clone)]
+			#[pyclass]
+			pub struct $name {
+				dist: graphidx::measures::$name<PyFloat>,
+			}
+			#[pymethods]
+			impl $name {
+				#[new]
+				#[pyo3(signature = ($($($arg,)*)?))]
+				fn new<'py>($($($arg: f64,)*)?) -> Self {
+					$name { dist: graphidx::measures::$name::new($($(<PyFloat as NumCast>::from($arg).unwrap(),)*)?)}
+				}
+				fn dist<'py>(&self, u: Bound<'py, PyArray1<PyFloat>>, v: Bound<'py, PyArray1<PyFloat>>) -> f64 {
+					<f64 as NumCast>::from(DistanceWrapper::<PyFloat>::dist(self, u, v)).unwrap()
+				}
+				fn to_enum(&self) -> DistanceEnum {
+					DistanceWrapper::<PyFloat>::to_enum(self.clone())
+				}
+			}
+			impl DistanceWrapper<PyFloat> for $name {
+				type Dist = graphidx::measures::$name<PyFloat>;
+				fn get_dist(&self) -> &graphidx::measures::$name<PyFloat> {
+					&self.dist
+				}
+				fn to_enum(self) -> DistanceEnum {
+					DistanceEnum::$name(self)
+				}
+			}
+			impl Into<DistanceEnum> for $name {
+				fn into(self) -> DistanceEnum {
+					self.to_enum()
+				}
+			}
+		}
+	};
+	(sparse $name: ident $(($($arg: ident),*$(,)?))?) => {
+		paste! {
+			#[derive(Clone)]
+			#[pyclass]
+			pub struct $name {
+				dist: graphidx::measures::$name<PyFloat,PyFloatUint>,
+			}
+			#[pymethods]
+			impl $name {
+				#[new]
+				#[pyo3(signature = ($($($arg,)*)?))]
+				fn new<'py>($($($arg:f64,)*)?) -> Self {
+					$name { dist: graphidx::measures::$name::new($($(<PyFloat as NumCast>::from($arg).unwrap(),)*)?) }
+				}
+				fn dist<'py>(&self, u: Bound<'py, PyArray1<PyFloat>>, v: Bound<'py, PyArray1<PyFloat>>) -> f64 {
+					<f64 as NumCast>::from(DistanceWrapper::<PyFloat>::dist(self, u, v)).unwrap()
+				}
+				fn to_enum(&self) -> DistanceEnum {
+					DistanceWrapper::<PyFloat>::to_enum(self.clone())
+				}
+			}
+			impl DistanceWrapper<PyFloat> for $name {
+				type Dist = graphidx::measures::$name<PyFloat,PyFloatUint>;
+				fn get_dist(&self) -> &graphidx::measures::$name<PyFloat,PyFloatUint> {
+					&self.dist
+				}
+				fn to_enum(self) -> DistanceEnum {
+					DistanceEnum::$name(self)
+				}
+			}
+			impl Into<DistanceEnum> for $name {
+				fn into(self) -> DistanceEnum {
+					self.to_enum()
+				}
+			}
+		}
+	};
+	(
+		$(
+			$label: ident [
+				$(
+					$name: ident$(($($arg: ident),*$(,)?))?
+				),*$(,)?
+			]
+		),*$(,)?
+	) => {	
+		#[derive(Clone)]
+		#[pyclass]
+		pub enum DistanceEnum {
+			$($($name($name)),*),*
+		}
+		impl Distance<PyFloat> for DistanceEnum {
+			#[inline(always)]
+			fn dist_slice(&self, obj1: &[PyFloat], obj2: &[PyFloat]) -> PyFloat {
+				match self {
+					$($(
+						Self::$name(d) => d.get_dist().dist_slice(obj1,obj2)
+					),*),*
+				}
+			}
+		}
+		$($(make_distance_wrapper!($label $name$(($($arg,)*))?);)*)?
+		macro_rules! add_distance_wrappers_to_module {
+			($module: ident) => {
+				$($(
+					$module.add_class::<$name>()?;
+				)*)*
+			};
+		}
+	};
+}
+make_distance_wrapper!(
+	normal [
+		SquaredEuclideanDistance, EuclideanDistance, NegDotProduct, CosineDistance, HammingDistance, DotProdSurrogateAdd, DotProdSurrogateSub, DotProdSurrogateMix(factor),
+	],
+	sparse [
+		SparseSquaredEuclideanDistance, SparseEuclideanDistance, SparseNormedSquaredEuclideanDistance, SparseNegDotProduct, SparseDotProdSurrogateAdd, SparseDotProdSurrogateSub, SparseDotProdSurrogateMix(factor),
+	],
+);
+
+type GSIndex<M> = GreedySingleGraphIndex<PyUint, PyFloat, DistanceEnum, M, DirLoLGraph<PyUint>>;
+type GCSIndex<M> = GreedyCappedSingleGraphIndex<PyUint, PyFloat, DistanceEnum, M, DirLoLGraph<PyUint>>;
+type GSWIndex<M> = GreedySingleGraphIndex<PyUint, PyFloat, DistanceEnum, M, WDirLoLGraph<PyUint, PyFloat>>;
+type GCSWIndex<M> = GreedyCappedSingleGraphIndex<PyUint, PyFloat, DistanceEnum, M, WDirLoLGraph<PyUint, PyFloat>>;
+// type FGSIndex<M> = GreedySingleGraphIndex<PyUint, PyFloat, DistanceEnum, M, FatDirGraph<PyUint>>;
+// type FGCSIndex<M> = GreedyCappedSingleGraphIndex<PyUint, PyFloat, DistanceEnum, M, FatDirGraph<PyUint>>;
+type GLIndex<M> = GreedyLayeredGraphIndex<PyUint, PyFloat, DistanceEnum, M, DirLoLGraph<PyUint>>;
+type GCLIndex<M> = GreedyCappedLayeredGraphIndex<PyUint, PyFloat, DistanceEnum, M, DirLoLGraph<PyUint>>;
+type FGLIndex<M> = GreedyLayeredGraphIndex<PyUint, PyFloat, DistanceEnum, M, FatDirGraph<PyUint>>;
+type FGCLIndex<M> = GreedyCappedLayeredGraphIndex<PyUint, PyFloat, DistanceEnum, M, FatDirGraph<PyUint>>;
 
 
-pub enum IndexOneOf<A: GraphIndex<usize,f32,SquaredEuclideanDistance<f32>>, B: GraphIndex<usize,f32,SquaredEuclideanDistance<f32>>> {
+pub enum IndexOneOf<A: GraphIndex<PyUint,PyFloat,DistanceEnum>, B: GraphIndex<PyUint,PyFloat,DistanceEnum>> {
 	A(A),
 	B(B),
 	None,
 }
 #[allow(dead_code)]
-impl<A: GraphIndex<usize,f32,SquaredEuclideanDistance<f32>>, B: GraphIndex<usize,f32,SquaredEuclideanDistance<f32>>> IndexOneOf<A,B> {
-	fn greedy_search(&self, queries: &ArrayView1<f32>, k: usize, max_heap_size: usize) -> (Array1<usize>, Array1<f32>) {
+impl<A: GraphIndex<PyUint,PyFloat,DistanceEnum>, B: GraphIndex<PyUint,PyFloat,DistanceEnum>> IndexOneOf<A,B> {
+	fn greedy_search(&self, queries: &ArrayView1<PyFloat>, k: usize, max_heap_size: usize) -> (Array1<PyUint>, Array1<PyFloat>) {
 		match self {
 				IndexOneOf::A(a) => a.greedy_search(queries, k, max_heap_size, &mut a._new_search_cache(max_heap_size)),
 				IndexOneOf::B(b) => b.greedy_search(queries, k, max_heap_size, &mut b._new_search_cache(max_heap_size)),
 				IndexOneOf::None => panic!(),
 		}
 	}
-	fn greedy_search_batch(&self, queries: &ArrayView2<f32>, k: usize, max_heap_size: usize) -> (Array2<usize>, Array2<f32>) {
+	fn greedy_search_batch<M: MatrixDataSource<PyFloat>+Sync>(&self, queries: &M, k: usize, max_heap_size: usize) -> (Array2<PyUint>, Array2<PyFloat>) {
 		match self {
-				IndexOneOf::A(a) => a.greedy_search_batch(queries, k, max_heap_size),
-				IndexOneOf::B(b) => b.greedy_search_batch(queries, k, max_heap_size),
-				IndexOneOf::None => panic!(),
+			IndexOneOf::A(a) => a.greedy_search_batch(queries, k, max_heap_size),
+			IndexOneOf::B(b) => b.greedy_search_batch(queries, k, max_heap_size),
+			IndexOneOf::None => panic!(),
 		}
 	}
 	fn as_a(&self) -> Option<&A> {
@@ -158,12 +367,63 @@ impl<A: GraphIndex<usize,f32,SquaredEuclideanDistance<f32>>, B: GraphIndex<usize
 }
 
 
+
 macro_rules! generic_graph_index_funs {
 	($type: ident) => {
+		generic_graph_index_funs!(_basic $type);
+		#[pymethods]
+		impl $type {
+			#[pyo3(signature = (distance, data))]
+			fn with_distance_and_data<'py>(&mut self, distance: DistanceEnum, data: Bound<'py, PyArray2<PyFloat>>) {
+				let data = unsafe { arrview2_py_to_rust(data.as_array()) };
+				let mut index_buffer = IndexOneOf::None;
+				std::mem::swap(&mut index_buffer, &mut self.index);
+				self.index = match index_buffer {
+					IndexOneOf::A(index) => IndexOneOf::A(index.with_distance_and_data(distance, data)),
+					IndexOneOf::B(index) => IndexOneOf::B(index.with_distance_and_data(distance, data)),
+					IndexOneOf::None => panic!(),
+				};
+			}
+		}
+	};
+	(layered $type: ident) => {
+		generic_graph_index_funs!($type);
+		generic_graph_index_funs!(_layered $type);
+	};
+	(single $type: ident) => {
+		generic_graph_index_funs!($type);
+		generic_graph_index_funs!(_single $type);
+	};
+	(owning $type: ident) => {
+		generic_graph_index_funs!(_basic $type);
+		#[pymethods]
+		impl $type {
+			#[pyo3(signature = (distance, data))]
+			fn with_distance_and_data<'py>(&mut self, distance: DistanceEnum, data: Bound<'py, PyArray2<PyFloat>>) {
+				let data = unsafe { arrview2_py_to_rust(data.as_array()).into_owned() };
+				let mut index_buffer = IndexOneOf::None;
+				std::mem::swap(&mut index_buffer, &mut self.index);
+				self.index = match index_buffer {
+					IndexOneOf::A(index) => IndexOneOf::A(index.with_distance_and_data(distance, data)),
+					IndexOneOf::B(index) => IndexOneOf::B(index.with_distance_and_data(distance, data)),
+					IndexOneOf::None => panic!(),
+				};
+			}
+		}
+	};
+	(owning layered $type: ident) => {
+		generic_graph_index_funs!(owning $type);
+		generic_graph_index_funs!(_layered $type);
+	};
+	(owning single $type: ident) => {
+		generic_graph_index_funs!(owning $type);
+		generic_graph_index_funs!(_single $type);
+	};
+	(_basic $type: ident) => {
 		#[pymethods]
 		impl $type {
 			#[pyo3(signature = (query, k, max_heap_size=None))]
-			fn knn_query<'py>(&self, py: Python<'py>, query: Bound<'py, PyArray1<f32>>, k: usize, max_heap_size: Option<usize>) -> (Bound<'py,PyArray1<usize>>, Bound<'py,PyArray1<f32>>) {
+			fn knn_query<'py>(&self, py: Python<'py>, query: Bound<'py, PyArray1<PyFloat>>, k: usize, max_heap_size: Option<usize>) -> (Bound<'py,PyArray1<PyUint>>, Bound<'py,PyArray1<PyFloat>>) {
 				unsafe {
 					let (ids, dists) = self.index.greedy_search(
 						&arrview1_py_to_rust(query.as_array()),
@@ -177,7 +437,7 @@ macro_rules! generic_graph_index_funs {
 				}
 			}
 			#[pyo3(signature = (queries, k, max_heap_size=None))]
-			fn knn_query_batch<'py>(&self, py: Python<'py>, queries: Bound<'py, PyArray2<f32>>, k: usize, max_heap_size: Option<usize>) -> (Bound<'py,PyArray2<usize>>, Bound<'py,PyArray2<f32>>) {
+			fn knn_query_batch<'py>(&self, py: Python<'py>, queries: Bound<'py, PyArray2<PyFloat>>, k: usize, max_heap_size: Option<usize>) -> (Bound<'py,PyArray2<PyUint>>, Bound<'py,PyArray2<PyFloat>>) {
 				unsafe {
 					let (ids, dists) = self.index.greedy_search_batch(
 						&arrview2_py_to_rust(queries.as_array()),
@@ -189,6 +449,104 @@ macro_rules! generic_graph_index_funs {
 						PyArray2::from_owned_array(py, arr2_rust_to_py(dists)),
 					)
 				}
+			}
+			#[pyo3(signature = (distance))]
+			fn with_distance(&mut self, distance: DistanceEnum) {
+				let mut index_buffer = IndexOneOf::None;
+				std::mem::swap(&mut index_buffer, &mut self.index);
+				self.index = match index_buffer {
+					IndexOneOf::A(index) => IndexOneOf::A(index.with_distance(distance)),
+					IndexOneOf::B(index) => IndexOneOf::B(index.with_distance(distance)),
+					IndexOneOf::None => panic!(),
+				};
+			}
+			#[pyo3(signature = (k, max_heap_size, slice=None))]
+			fn self_join_query(&self, k: usize, max_heap_size: usize, slice: Option<(usize,usize)>) -> PySelfJoinGraph {
+				match &self.index {
+					IndexOneOf::A(index) => {
+						let graph = index.self_join_query_slice(k, max_heap_size, slice);
+						PySelfJoinGraph {
+							index: IndexOneOf::A(GSWIndex {
+								_phantom: std::marker::PhantomData,
+								data: unsafe {std::mem::transmute(index.data.view())},
+								graph: graph,
+								distance: index.distance.clone(),
+								entry_points: None,
+							}),
+							max_frontier_size: None,
+						}
+					},
+					IndexOneOf::B(index) => {
+						let graph = index.self_join_query_slice(k, max_heap_size, slice);
+						PySelfJoinGraph {
+							index: IndexOneOf::A(GSWIndex {
+								_phantom: std::marker::PhantomData,
+								data: unsafe {std::mem::transmute(index.data.view())},
+								graph: graph,
+								distance: index.distance.clone(),
+								entry_points: None,
+							}),
+							max_frontier_size: None,
+						}
+					},
+					IndexOneOf::None => panic!(),
+				}
+			}
+			#[pyo3(signature = (k, max_heap_size, slice=None))]
+			fn self_join_query_local(&self, k: usize, max_heap_size: usize, slice: Option<(usize,usize)>) -> PySelfJoinGraph {
+				match &self.index {
+					IndexOneOf::A(index) => {
+						let graph = index.self_join_query_local_slice(k, max_heap_size, slice);
+						PySelfJoinGraph {
+							index: IndexOneOf::A(GSWIndex {
+								_phantom: std::marker::PhantomData,
+								data: unsafe {std::mem::transmute(index.data.view())},
+								graph: graph,
+								distance: index.distance.clone(),
+								entry_points: None,
+							}),
+							max_frontier_size: None,
+						}
+					},
+					IndexOneOf::B(index) => {
+						let graph = index.self_join_query_local_slice(k, max_heap_size, slice);
+						PySelfJoinGraph {
+							index: IndexOneOf::A(GSWIndex {
+								_phantom: std::marker::PhantomData,
+								data: unsafe {std::mem::transmute(index.data.view())},
+								graph: graph,
+								distance: index.distance.clone(),
+								entry_points: None,
+							}),
+							max_frontier_size: None,
+						}
+					},
+					IndexOneOf::None => panic!(),
+				}
+			}
+			#[pyo3(signature = (k, max_heap_size, slice=None))]
+			fn self_join_query_arr<'py>(&self, py: Python<'py>, k: usize, max_heap_size: usize, slice: Option<(usize,usize)>) -> (Bound<'py,PyArray2<PyUint>>, Bound<'py,PyArray2<PyFloat>>) {
+				let (ids, dists) = match &self.index {
+					IndexOneOf::A(index) => index.self_join_query_arr_slice(k, max_heap_size, slice),
+					IndexOneOf::B(index) => index.self_join_query_arr_slice(k, max_heap_size, slice),
+					IndexOneOf::None => panic!(),
+				};
+				(
+					PyArray2::from_owned_array(py, arr2_rust_to_py(ids)),
+					PyArray2::from_owned_array(py, arr2_rust_to_py(dists)),
+				)
+			}
+			#[pyo3(signature = (k, max_heap_size, slice=None))]
+			fn self_join_query_local_arr<'py>(&self, py: Python<'py>, k: usize, max_heap_size: usize, slice: Option<(usize,usize)>) -> (Bound<'py,PyArray2<PyUint>>, Bound<'py,PyArray2<PyFloat>>) {
+				let (ids, dists) = match &self.index {
+					IndexOneOf::A(index) => index.self_join_query_local_arr_slice(k, max_heap_size, slice),
+					IndexOneOf::B(index) => index.self_join_query_local_arr_slice(k, max_heap_size, slice),
+					IndexOneOf::None => panic!(),
+				};
+				(
+					PyArray2::from_owned_array(py, arr2_rust_to_py(ids)),
+					PyArray2::from_owned_array(py, arr2_rust_to_py(dists)),
+				)
 			}
 			#[getter]
 			fn get_max_frontier_size(&self) -> Option<usize> {
@@ -217,8 +575,7 @@ macro_rules! generic_graph_index_funs {
 			}
 		}
 	};
-	(layered $type: ident) => {
-		generic_graph_index_funs!($type);
+	(_layered $type: ident) => {
 		#[pymethods]
 		impl $type {
 			fn get_graph_stats(&self) -> Vec<GraphStats> {
@@ -228,26 +585,26 @@ macro_rules! generic_graph_index_funs {
 					IndexOneOf::None => panic!(),
 				}
 			}
-			fn get_neighbors(&self, layer: usize, node: usize) -> Vec<usize> {
+			fn get_neighbors(&self, layer: usize, node: PyUint) -> Vec<PyUint> {
 				match &self.index {
 					IndexOneOf::A(index) => index.graphs()[layer].neighbors(node),
 					IndexOneOf::B(index) => index.graphs()[layer].neighbors(node),
 					IndexOneOf::None => panic!(),
 				}
 			}
-			fn get_next_layer_id(&self, layer: usize, node: usize) -> usize {
+			fn get_next_layer_id(&self, layer: usize, node: PyUint) -> PyUint {
 				if layer == 0 { return node; }
 				match &self.index {
-					IndexOneOf::A(index) => index.get_local_layer_ids(layer).unwrap()[node],
-					IndexOneOf::B(index) => index.get_local_layer_ids(layer).unwrap()[node],
+					IndexOneOf::A(index) => index.get_local_layer_ids(layer).unwrap()[node as usize],
+					IndexOneOf::B(index) => index.get_local_layer_ids(layer).unwrap()[node as usize],
 					IndexOneOf::None => panic!(),
 				}
 			}
-			fn get_global_id(&self, layer: usize, node: usize) -> usize {
+			fn get_global_id(&self, layer: usize, node: PyUint) -> PyUint {
 				if layer == 0 { return node; }
 				match &self.index {
-					IndexOneOf::A(index) => index.get_global_layer_ids(layer).unwrap()[node],
-					IndexOneOf::B(index) => index.get_global_layer_ids(layer).unwrap()[node],
+					IndexOneOf::A(index) => index.get_global_layer_ids(layer).unwrap()[node as usize],
+					IndexOneOf::B(index) => index.get_global_layer_ids(layer).unwrap()[node as usize],
 					IndexOneOf::None => panic!(),
 				}
 			}
@@ -267,8 +624,7 @@ macro_rules! generic_graph_index_funs {
 			}
 		}
 	};
-	(single $type: ident) => {
-		generic_graph_index_funs!($type);
+	(_single $type: ident) => {
 		#[pymethods]
 		impl $type {
 			fn get_graph_stats(&self) -> GraphStats {
@@ -278,7 +634,7 @@ macro_rules! generic_graph_index_funs {
 					IndexOneOf::None => panic!(),
 				}
 			}
-			fn get_neighbors(&self, node: usize) -> Vec<usize> {
+			fn get_neighbors(&self, node: PyUint) -> Vec<PyUint> {
 				match &self.index {
 					IndexOneOf::A(index) => index.graph().neighbors(node),
 					IndexOneOf::B(index) => index.graph().neighbors(node),
@@ -301,21 +657,146 @@ macro_rules! generic_graph_index_funs {
 			}
 		}
 	};
+	(sparse $type: ident) => {
+		#[pymethods]
+		impl $type {
+			#[pyo3(signature = (query_data, query_indices, k, max_heap_size=None))]
+			fn knn_query<'py>(&self, py: Python<'py>, query_data: Bound<'py, PyArray1<PyFloat>>, query_indices: Bound<'py, PyArray1<PyFloatInt>>, k: usize, max_heap_size: Option<usize>) -> (Bound<'py,PyArray1<PyUint>>, Bound<'py,PyArray1<PyFloat>>) {
+				/* TODO: This should work on the (data,indices,indptr) tuple instead */
+				unsafe {
+					let data = arrview1_py_to_rust(query_data.as_array());
+					let indices = arrview1_py_to_rust(query_indices.as_array());
+					let interleaved = Array1::from_iter(
+						indices.into_iter()
+						.zip(data.into_iter())
+						.map(|(&i,&v)| {
+							std::iter::once(i.transmute()).chain(std::iter::once(v))
+						}).flatten()
+					);
+					let (ids, dists) = self.index.greedy_search(
+						&interleaved.view(),
+						k,
+						max_heap_size.unwrap_or(2*k),
+					);
+					(
+						PyArray1::from_owned_array(py, arr1_rust_to_py(ids)),
+						PyArray1::from_owned_array(py, arr1_rust_to_py(dists)),
+					)
+				}
+			}
+			#[pyo3(signature = (query_data, query_indices, query_indptr, k, max_heap_size=None))]
+			fn knn_query_batch<'py>(&self, py: Python<'py>, query_data: Bound<'py, PyArray1<PyFloat>>, query_indices: Bound<'py, PyArray1<PyFloatInt>>, query_indptr: Bound<'py, PyArray1<PyInt>>, k: usize, max_heap_size: Option<usize>) -> (Bound<'py,PyArray2<PyUint>>, Bound<'py,PyArray2<PyFloat>>) {
+				unsafe {
+					let data = arrview1_py_to_rust(query_data.as_array());
+					let indices = arrview1_py_to_rust(query_indices.as_array());
+					let indptr = arrview1_py_to_rust(query_indptr.as_array());
+					let queries = InterleavedSparseMatrix::from_csr(data, indices, indptr, None);
+					let (ids, dists) = self.index.greedy_search_batch(
+						&queries,
+						k,
+						max_heap_size.unwrap_or(2*k),
+					);
+					(
+						PyArray2::from_owned_array(py, arr2_rust_to_py(ids)),
+						PyArray2::from_owned_array(py, arr2_rust_to_py(dists)),
+					)
+				}
+			}
+			#[pyo3(signature = (distance))]
+			fn with_distance(&mut self, distance: DistanceEnum) {
+				let mut index_buffer = IndexOneOf::None;
+				std::mem::swap(&mut index_buffer, &mut self.index);
+				self.index = match index_buffer {
+					IndexOneOf::A(index) => IndexOneOf::A(index.with_distance(distance)),
+					IndexOneOf::B(index) => IndexOneOf::B(index.with_distance(distance)),
+					IndexOneOf::None => panic!(),
+				};
+			}
+			#[pyo3(signature = (distance, data, indices, indptr))]
+			fn with_distance_and_data<'py>(&mut self, distance: DistanceEnum, data: Bound<'py, PyArray1<PyFloat>>, indices: Bound<'py, PyArray1<PyFloatInt>>, indptr: Bound<'py, PyArray1<PyInt>>) {
+				let mut index_buffer = IndexOneOf::None;
+				let interleaved_data = unsafe {
+					let data = arrview1_py_to_rust(data.as_array());
+					let indices = arrview1_py_to_rust(indices.as_array());
+					let indptr = arrview1_py_to_rust(indptr.as_array());
+					InterleavedSparseMatrix::from_csr(data, indices, indptr, None)
+				};
+				std::mem::swap(&mut index_buffer, &mut self.index);
+				self.index = match index_buffer {
+					IndexOneOf::A(index) => IndexOneOf::A(index.with_distance_and_data(distance, interleaved_data)),
+					IndexOneOf::B(index) => IndexOneOf::B(index.with_distance_and_data(distance, interleaved_data)),
+					IndexOneOf::None => panic!(),
+				};
+			}
+			#[getter]
+			fn get_max_frontier_size(&self) -> Option<usize> {
+				self.max_frontier_size
+			}
+			#[setter]
+			fn set_max_frontier_size(&mut self, max_frontier_size: Option<usize>) {
+				self.max_frontier_size = max_frontier_size;
+				if self.max_frontier_size.is_none() {
+					if self.index.is_b() {
+						let mut index = IndexOneOf::None;
+						std::mem::swap(&mut self.index, &mut index);
+						let mut index = index.into_a(|index| index.into_uncapped());
+						std::mem::swap(&mut self.index, &mut index);
+					}
+				} else {
+					if self.index.is_a() {
+						let mut index = IndexOneOf::None;
+						std::mem::swap(&mut self.index, &mut index);
+						let mut index = index.into_b(|index| index.into_capped(max_frontier_size.unwrap()));
+						std::mem::swap(&mut self.index, &mut index);
+					} else {
+						self.index.as_b_mut().unwrap().set_max_frontier_size(max_frontier_size.unwrap());
+					}
+				}
+			}
+		}
+	};
+}
+
+
+#[pyclass]
+pub struct PySelfJoinGraph {
+	index: IndexOneOf<GSWIndex<ArrayView2<'static,PyFloat>>, GCSWIndex<ArrayView2<'static,PyFloat>>>,
+	max_frontier_size: Option<usize>,
+}
+generic_graph_index_funs!(single PySelfJoinGraph);
+#[pymethods]
+impl PySelfJoinGraph {
+	#[cfg(not(feature="pyprec16"))]
+	fn get_neighbors_with_weight(&self, node: PyUint) -> Vec<(PyFloat,PyUint)> {
+		match &self.index {
+			IndexOneOf::A(index) => index.graph().neighbors_with_zipped_weights(node),
+			IndexOneOf::B(index) => index.graph().neighbors_with_zipped_weights(node),
+			IndexOneOf::None => panic!(),
+		}
+	}
+	#[cfg(feature="pyprec16")]
+	fn get_neighbors_with_weight(&self, node: PyUint) -> Vec<(f32,PyUint)> {
+		match &self.index {
+			IndexOneOf::A(index) => index.graph().neighbors_with_zipped_weights(node).into_iter().map(|(v,r)| (v.to_f32(),r)).collect(),
+			IndexOneOf::B(index) => index.graph().neighbors_with_zipped_weights(node).into_iter().map(|(v,r)| (v.to_f32(),r)).collect(),
+			IndexOneOf::None => panic!(),
+		}
+	}
 }
 
 
 #[pyclass]
 pub struct PyHNSW {
-	index: IndexOneOf<GLIndex<ArrayView2<'static,f32>>, GCLIndex<ArrayView2<'static,f32>>>,
+	index: IndexOneOf<GLIndex<ArrayView2<'static,PyFloat>>, GCLIndex<ArrayView2<'static,PyFloat>>>,
 	max_frontier_size: Option<usize>,
 	flooding: bool,
 }
 #[pymethods]
 impl PyHNSW {
 	#[new]
-	#[pyo3(signature = (data, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, finetune_rnn=None, finetune_sen=None, max_frontier_size=None, higher_level_max_heap_size=None, flooding=None))]
+	#[pyo3(signature = (data, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, finetune_rnn=None, finetune_sen=None, max_frontier_size=None, higher_level_max_heap_size=None, flooding=None, distance=None))]
 	fn new<'py>(
-		data: Bound<'py, PyArray2<f32>>,
+		data: Bound<'py, PyArray2<PyFloat>>,
 		higher_max_degree: Option<usize>,
 		lowest_max_degree: Option<usize>,
 		max_layers: Option<usize>,
@@ -333,6 +814,7 @@ impl PyHNSW {
 		max_frontier_size: Option<usize>,
 		higher_level_max_heap_size: Option<usize>,
 		flooding: Option<bool>,
+		distance: Option<DistanceEnum>,
 	) -> Self {
 		let hnsw_params = HNSWParams::new()
 		.maybe_with_higher_max_degree(higher_max_degree)
@@ -350,11 +832,12 @@ impl PyHNSW {
 		.maybe_with_finetune_rnn(finetune_rnn)
 		.maybe_with_finetune_sen(finetune_sen)
 		;
+		let distance = distance.unwrap_or(DistanceEnum::SquaredEuclideanDistance(SquaredEuclideanDistance::new()));
 		unsafe {
 			if flooding.unwrap_or(false) {
 				let index = FloodingHNSWBuilder::build(
 					arrview2_py_to_rust(data.as_array()),
-					SquaredEuclideanDistance::new(),
+					distance,
 					hnsw_params,
 					higher_level_max_heap_size.unwrap_or(1),
 				);
@@ -367,7 +850,7 @@ impl PyHNSW {
 			} else {
 				let index = HNSWParallelHeapBuilder::build(
 					arrview2_py_to_rust(data.as_array()),
-					SquaredEuclideanDistance::new(),
+					distance,
 					hnsw_params,
 					higher_level_max_heap_size.unwrap_or(1),
 				);
@@ -388,15 +871,15 @@ impl PyHNSW {
 generic_graph_index_funs!(layered PyHNSW);
 #[pyclass]
 pub struct PyFatHNSW {
-	index: IndexOneOf<FGLIndex<ArrayView2<'static,f32>>, FGCLIndex<ArrayView2<'static,f32>>>,
+	index: IndexOneOf<FGLIndex<ArrayView2<'static,PyFloat>>, FGCLIndex<ArrayView2<'static,PyFloat>>>,
 	max_frontier_size: Option<usize>,
 }
 #[pymethods]
 impl PyFatHNSW {
 	#[new]
-	#[pyo3(signature = (data, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, finetune_rnn=None, finetune_sen=None, max_frontier_size=None, higher_level_max_heap_size=None))]
+	#[pyo3(signature = (data, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, finetune_rnn=None, finetune_sen=None, max_frontier_size=None, higher_level_max_heap_size=None, distance=None))]
 	fn new<'py>(
-		data: Bound<'py, PyArray2<f32>>,
+		data: Bound<'py, PyArray2<PyFloat>>,
 		higher_max_degree: Option<usize>,
 		lowest_max_degree: Option<usize>,
 		max_layers: Option<usize>,
@@ -413,6 +896,7 @@ impl PyFatHNSW {
 		finetune_sen: Option<bool>,
 		max_frontier_size: Option<usize>,
 		higher_level_max_heap_size: Option<usize>,
+		distance: Option<DistanceEnum>,
 	) -> Self {
 		let hnsw_params = HNSWParams::new()
 		.maybe_with_higher_max_degree(higher_max_degree)
@@ -430,10 +914,11 @@ impl PyFatHNSW {
 		.maybe_with_finetune_rnn(finetune_rnn)
 		.maybe_with_finetune_sen(finetune_sen)
 		;
+		let distance = distance.unwrap_or(DistanceEnum::SquaredEuclideanDistance(SquaredEuclideanDistance::new()));
 		unsafe {
 			let index = HNSWParallelHeapBuilder::build_fat(
 				arrview2_py_to_rust(data.as_array()),
-				SquaredEuclideanDistance::new(),
+				distance,
 				hnsw_params,
 				higher_level_max_heap_size.unwrap_or(1),
 			);
@@ -449,15 +934,15 @@ impl PyFatHNSW {
 generic_graph_index_funs!(layered PyFatHNSW);
 #[pyclass]
 pub struct OwningPyHNSW {
-	index: IndexOneOf<GLIndex<Array2<f32>>, GCLIndex<Array2<f32>>>,
+	index: IndexOneOf<GLIndex<Array2<PyFloat>>, GCLIndex<Array2<PyFloat>>>,
 	max_frontier_size: Option<usize>,
 }
 #[pymethods]
 impl OwningPyHNSW {
 	#[new]
-	#[pyo3(signature = (data, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, finetune_rnn=None, finetune_sen=None, max_frontier_size=None, higher_level_max_heap_size=None))]
+	#[pyo3(signature = (data, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, finetune_rnn=None, finetune_sen=None, max_frontier_size=None, higher_level_max_heap_size=None, distance=None))]
 	fn new<'py>(
-		data: Bound<'py, PyArray2<f32>>,
+		data: Bound<'py, PyArray2<PyFloat>>,
 		higher_max_degree: Option<usize>,
 		lowest_max_degree: Option<usize>,
 		max_layers: Option<usize>,
@@ -474,6 +959,7 @@ impl OwningPyHNSW {
 		finetune_sen: Option<bool>,
 		max_frontier_size: Option<usize>,
 		higher_level_max_heap_size: Option<usize>,
+		distance: Option<DistanceEnum>,
 	) -> Self {
 		let hnsw_params = HNSWParams::new()
 		.maybe_with_higher_max_degree(higher_max_degree)
@@ -491,10 +977,11 @@ impl OwningPyHNSW {
 		.maybe_with_finetune_rnn(finetune_rnn)
 		.maybe_with_finetune_sen(finetune_sen)
 		;
+		let distance = distance.unwrap_or(DistanceEnum::SquaredEuclideanDistance(SquaredEuclideanDistance::new()));
 		unsafe {
 			let index = HNSWParallelHeapBuilder::build(
 				arrview2_py_to_rust(data.as_array()).into_owned(),
-				SquaredEuclideanDistance::new(),
+				distance,
 				hnsw_params,
 				higher_level_max_heap_size.unwrap_or(1),
 			);
@@ -507,18 +994,18 @@ impl OwningPyHNSW {
 		}
 	}
 }
-generic_graph_index_funs!(layered OwningPyHNSW);
+generic_graph_index_funs!(owning layered OwningPyHNSW);
 #[pyclass]
 pub struct OwningPyFatHNSW {
-	index: IndexOneOf<FGLIndex<Array2<f32>>, FGCLIndex<Array2<f32>>>,
+	index: IndexOneOf<FGLIndex<Array2<PyFloat>>, FGCLIndex<Array2<PyFloat>>>,
 	max_frontier_size: Option<usize>,
 }
 #[pymethods]
 impl OwningPyFatHNSW {
 	#[new]
-	#[pyo3(signature = (data, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, finetune_rnn=None, finetune_sen=None, max_frontier_size=None))]
+	#[pyo3(signature = (data, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, finetune_rnn=None, finetune_sen=None, max_frontier_size=None, distance=None))]
 	fn new<'py>(
-		data: Bound<'py, PyArray2<f32>>,
+		data: Bound<'py, PyArray2<PyFloat>>,
 		higher_max_degree: Option<usize>,
 		lowest_max_degree: Option<usize>,
 		max_layers: Option<usize>,
@@ -534,6 +1021,7 @@ impl OwningPyFatHNSW {
 		finetune_rnn: Option<bool>,
 		finetune_sen: Option<bool>,
 		max_frontier_size: Option<usize>,
+		distance: Option<DistanceEnum>,
 	) -> Self {
 		let hnsw_params = HNSWParams::new()
 		.maybe_with_higher_max_degree(higher_max_degree)
@@ -551,10 +1039,11 @@ impl OwningPyFatHNSW {
 		.maybe_with_finetune_rnn(finetune_rnn)
 		.maybe_with_finetune_sen(finetune_sen)
 		;
+		let distance = distance.unwrap_or(DistanceEnum::SquaredEuclideanDistance(SquaredEuclideanDistance::new()));
 		unsafe {
 			let index = HNSWParallelHeapBuilder::build_fat(
 				arrview2_py_to_rust(data.as_array()).into_owned(),
-				SquaredEuclideanDistance::new(),
+				distance,
 				hnsw_params,
 				1,
 			);
@@ -567,20 +1056,20 @@ impl OwningPyFatHNSW {
 		}
 	}
 }
-generic_graph_index_funs!(layered OwningPyFatHNSW);
+generic_graph_index_funs!(owning layered OwningPyFatHNSW);
 
 #[pyclass]
 pub struct PySENHNSW {
-	index: IndexOneOf<GLIndex<ArrayView2<'static,f32>>, GCLIndex<ArrayView2<'static,f32>>>,
+	index: IndexOneOf<GLIndex<ArrayView2<'static,PyFloat>>, GCLIndex<ArrayView2<'static,PyFloat>>>,
 	max_frontier_size: Option<usize>,
 	flooding: bool,
 }
 #[pymethods]
 impl PySENHNSW {
 	#[new]
-	#[pyo3(signature = (data, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, finetune_rnn=None, finetune_sen=None, max_frontier_size=None, max_cos=None, higher_level_max_heap_size=None, flooding=None))]
+	#[pyo3(signature = (data, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, finetune_rnn=None, finetune_sen=None, max_frontier_size=None, max_cos=None, higher_level_max_heap_size=None, flooding=None, distance=None))]
 	fn new<'py>(
-		data: Bound<'py, PyArray2<f32>>,
+		data: Bound<'py, PyArray2<PyFloat>>,
 		higher_max_degree: Option<usize>,
 		lowest_max_degree: Option<usize>,
 		max_layers: Option<usize>,
@@ -599,7 +1088,14 @@ impl PySENHNSW {
 		max_cos: Option<f64>,
 		higher_level_max_heap_size: Option<usize>,
 		flooding: Option<bool>,
+		distance: Option<DistanceEnum>,
 	) -> Self {
+		#[cfg(feature="pyprec16")]
+		let sen_params = SENParams::new()
+		.maybe_with_max_cos(max_cos.map(|v| PyFloat::from_f64(v)));
+		#[cfg(not(feature="pyprec16"))]
+		let sen_params = SENParams::new()
+		.maybe_with_max_cos(max_cos.map(|v| v as PyFloat));
 		let hnsw_params = HNSWSENParams::new()
 		.maybe_with_higher_max_degree(higher_max_degree)
 		.maybe_with_lowest_max_degree(lowest_max_degree)
@@ -615,16 +1111,15 @@ impl PySENHNSW {
 		.maybe_with_n_rounds(n_rounds)
 		.maybe_with_finetune_rnn(finetune_rnn)
 		.maybe_with_finetune_sen(finetune_sen)
-		.with_finetune_sen_params(SENParams::new()
-			.maybe_with_max_cos(max_cos.map(|v| v as f32))
-		)
+		.with_finetune_sen_params(sen_params)
 		.maybe_with_max_cos(max_cos)
 		;
+		let distance = distance.unwrap_or(DistanceEnum::SquaredEuclideanDistance(SquaredEuclideanDistance::new()));
 		unsafe {
 			if flooding.unwrap_or(false) {
 				let index = FloodingHNSWSENBuilder::build(
 					arrview2_py_to_rust(data.as_array()),
-					SquaredEuclideanDistance::new(),
+					distance,
 					hnsw_params,
 					higher_level_max_heap_size.unwrap_or(1),
 				);
@@ -637,7 +1132,7 @@ impl PySENHNSW {
 			} else {
 				let index = HNSWParallelSENHeapBuilder::build(
 					arrview2_py_to_rust(data.as_array()),
-					SquaredEuclideanDistance::new(),
+					distance,
 					hnsw_params,
 					higher_level_max_heap_size.unwrap_or(1),
 				);
@@ -659,21 +1154,22 @@ generic_graph_index_funs!(layered PySENHNSW);
 
 #[pyclass]
 pub struct PyRNNDescent {
-	index: IndexOneOf<GSIndex<ArrayView2<'static,f32>>, GCSIndex<ArrayView2<'static,f32>>>,
+	index: IndexOneOf<GSIndex<ArrayView2<'static,PyFloat>>, GCSIndex<ArrayView2<'static,PyFloat>>>,
 	max_frontier_size: Option<usize>,
 }
 #[pymethods]
 impl PyRNNDescent {
 	#[new]
-	#[pyo3(signature = (data, initial_degree=None, reduce_degree=None, n_outer_loops=None, n_inner_loops=None, concurrent_batch_size=None, max_frontier_size=None))]
+	#[pyo3(signature = (data, initial_degree=None, reduce_degree=None, n_outer_loops=None, n_inner_loops=None, concurrent_batch_size=None, max_frontier_size=None, distance=None))]
 	fn new<'py>(
-		data: Bound<'py, PyArray2<f32>>,
+		data: Bound<'py, PyArray2<PyFloat>>,
 		initial_degree: Option<usize>,
 		reduce_degree: Option<usize>,
 		n_outer_loops: Option<usize>,
 		n_inner_loops: Option<usize>,
 		concurrent_batch_size: Option<usize>,
 		max_frontier_size: Option<usize>,
+		distance: Option<DistanceEnum>,
 	) -> Self {
 		let params = crate::rnn::RNNParams::new()
 		.maybe_with_initial_degree(initial_degree)
@@ -682,10 +1178,11 @@ impl PyRNNDescent {
 		.maybe_with_n_inner_loops(n_inner_loops)
 		.maybe_with_concurrent_batch_size(concurrent_batch_size)
 		;
+		let distance = distance.unwrap_or(DistanceEnum::SquaredEuclideanDistance(SquaredEuclideanDistance::new()));
 		unsafe {
 			let index = crate::rnn::RNNDescentBuilder::build(
 				arrview2_py_to_rust(data.as_array()),
-				SquaredEuclideanDistance::new(),
+				distance,
 				params,
 			);
 			if max_frontier_size.is_none() {
@@ -700,26 +1197,31 @@ impl PyRNNDescent {
 generic_graph_index_funs!(single PyRNNDescent);
 #[pyclass]
 pub struct PySENDescent {
-	index: IndexOneOf<GSIndex<ArrayView2<'static,f32>>, GCSIndex<ArrayView2<'static,f32>>>,
+	index: IndexOneOf<GSIndex<ArrayView2<'static,PyFloat>>, GCSIndex<ArrayView2<'static,PyFloat>>>,
 	max_frontier_size: Option<usize>,
 }
 #[pymethods]
 impl PySENDescent {
 	#[new]
-	#[pyo3(signature = (data, initial_degree=None, reduce_degree=None, n_outer_loops=None, n_inner_loops=None, concurrent_batch_size=None, max_cos=None, dist_is_sq=None, prune_non_sen_edges=None, verify_sen_edges=None, max_frontier_size=None))]
+	#[pyo3(signature = (data, initial_degree=None, reduce_degree=None, n_outer_loops=None, n_inner_loops=None, concurrent_batch_size=None, max_cos=None, dist_is_sq=None, prune_non_sen_edges=None, verify_sen_edges=None, max_frontier_size=None, distance=None))]
 	fn new<'py>(
-		data: Bound<'py, PyArray2<f32>>,
+		data: Bound<'py, PyArray2<PyFloat>>,
 		initial_degree: Option<usize>,
 		reduce_degree: Option<usize>,
 		n_outer_loops: Option<usize>,
 		n_inner_loops: Option<usize>,
 		concurrent_batch_size: Option<usize>,
-		max_cos: Option<f32>,
+		max_cos: Option<f64>,
 		dist_is_sq: Option<bool>,
 		prune_non_sen_edges: Option<bool>,
 		verify_sen_edges: Option<bool>,
 		max_frontier_size: Option<usize>,
+		distance: Option<DistanceEnum>,
 	) -> Self {
+		#[cfg(feature="pyprec16")]
+		let max_cos = max_cos.map(|v| PyFloat::from_f64(v));
+		#[cfg(not(feature="pyprec16"))]
+		let max_cos = max_cos.map(|v| v as PyFloat);
 		let params = crate::rnn::SENParams::new()
 		.maybe_with_initial_degree(initial_degree)
 		.maybe_with_reduce_degree(reduce_degree)
@@ -731,10 +1233,11 @@ impl PySENDescent {
 		.maybe_with_prune_non_sen_edges(prune_non_sen_edges)
 		.maybe_with_verify_sen_edges(verify_sen_edges)
 		;
+		let distance = distance.unwrap_or(DistanceEnum::SquaredEuclideanDistance(SquaredEuclideanDistance::new()));
 		unsafe {
 			let index = crate::rnn::SENDescentBuilder::build(
 				arrview2_py_to_rust(data.as_array()),
-				SquaredEuclideanDistance::new(),
+				distance,
 				params,
 			);
 			if max_frontier_size.is_none() {
@@ -749,14 +1252,110 @@ impl PySENDescent {
 generic_graph_index_funs!(single PySENDescent);
 
 
+
+#[pyclass]
+pub struct SparsePyHNSW {
+	index: IndexOneOf<GLIndex<InterleavedSparseMatrix<PyFloat>>, GCLIndex<InterleavedSparseMatrix<PyFloat>>>,
+	max_frontier_size: Option<usize>,
+	flooding: bool,
+}
+#[pymethods]
+impl SparsePyHNSW {
+	#[new]
+	#[pyo3(signature = (data, indices, indptr, n_cols=None, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, finetune_rnn=None, finetune_sen=None, max_frontier_size=None, higher_level_max_heap_size=None, flooding=None, distance=None))]
+	fn from_csr<'py>(
+		data: Bound<'py, PyArray1<PyFloat>>,
+		indices: Bound<'py, PyArray1<PyFloatInt>>,
+		indptr: Bound<'py, PyArray1<PyInt>>,
+		n_cols: Option<usize>,
+		higher_max_degree: Option<usize>,
+		lowest_max_degree: Option<usize>,
+		max_layers: Option<usize>,
+		n_parallel_burnin: Option<usize>,
+		max_build_heap_size: Option<usize>,
+		max_build_frontier_size: Option<usize>,
+		level_norm_param_override: Option<f32>,
+		insert_heuristic: Option<bool>,
+		insert_heuristic_extend: Option<bool>,
+		post_prune_heuristic: Option<bool>,
+		insert_minibatch_size: Option<usize>,
+		n_rounds: Option<usize>,
+		finetune_rnn: Option<bool>,
+		finetune_sen: Option<bool>,
+		max_frontier_size: Option<usize>,
+		higher_level_max_heap_size: Option<usize>,
+		flooding: Option<bool>,
+		distance: Option<DistanceEnum>,
+	) -> Self {
+		let hnsw_params = HNSWParams::new()
+		.maybe_with_higher_max_degree(higher_max_degree)
+		.maybe_with_lowest_max_degree(lowest_max_degree)
+		.maybe_with_max_layers(max_layers)
+		.maybe_with_n_parallel_burnin(n_parallel_burnin)
+		.maybe_with_max_build_heap_size(max_build_heap_size)
+		.with_max_build_frontier_size(max_build_frontier_size)
+		.with_level_norm_param_override(level_norm_param_override)
+		.maybe_with_insert_heuristic(insert_heuristic)
+		.maybe_with_insert_heuristic_extend(insert_heuristic_extend)
+		.maybe_with_post_prune_heuristic(post_prune_heuristic)
+		.maybe_with_insert_minibatch_size(insert_minibatch_size)
+		.maybe_with_n_rounds(n_rounds)
+		.maybe_with_finetune_rnn(finetune_rnn)
+		.maybe_with_finetune_sen(finetune_sen)
+		;
+		let distance = distance.unwrap_or(DistanceEnum::SparseSquaredEuclideanDistance(SparseSquaredEuclideanDistance::new()));
+		unsafe {
+			let data = arrview1_py_to_rust(data.as_array());
+			let indices = arrview1_py_to_rust(indices.as_array());
+			let indptr = arrview1_py_to_rust(indptr.as_array());
+			let mat = InterleavedSparseMatrix::from_csr(data, indices, indptr, n_cols);
+			if flooding.unwrap_or(false) {
+				let index = FloodingHNSWBuilder::build(
+					mat,
+					distance,
+					hnsw_params,
+					higher_level_max_heap_size.unwrap_or(1),
+				);
+				if max_frontier_size.is_some() {
+					let capped_index = index.into_capped(max_frontier_size.unwrap_unchecked());
+					SparsePyHNSW { index: IndexOneOf::B(capped_index), max_frontier_size: max_frontier_size, flooding: true }
+				} else {
+					SparsePyHNSW { index: IndexOneOf::A(index), max_frontier_size: None, flooding: true }
+				}
+			} else {
+				let index = HNSWParallelHeapBuilder::build(
+					mat,
+					distance,
+					hnsw_params,
+					higher_level_max_heap_size.unwrap_or(1),
+				);
+				if max_frontier_size.is_some() {
+					let capped_index = index.into_capped(max_frontier_size.unwrap_unchecked());
+					SparsePyHNSW { index: IndexOneOf::B(capped_index), max_frontier_size: max_frontier_size, flooding: false }
+				} else {
+					SparsePyHNSW { index: IndexOneOf::A(index), max_frontier_size: None, flooding: false }
+				}
+			}
+		}
+	}
+	#[getter]
+	fn get_flooding(&self) -> bool {
+		self.flooding
+	}
+}
+generic_graph_index_funs!(sparse SparsePyHNSW);
+generic_graph_index_funs!(_layered SparsePyHNSW);
+
+
+
 #[pyfunction]
 #[pyo3(signature = (file, max_frontier_size=None))]
 pub fn load_hnswlib(file: &str, max_frontier_size: Option<usize>) -> OwningPyHNSW {
 	let index = crate::hnsw::load_hnswlib(file);
 	if max_frontier_size.is_none() {
-		OwningPyHNSW{index:IndexOneOf::A(index), max_frontier_size:None}
+		OwningPyHNSW{index:IndexOneOf::A(index.with_distance(SquaredEuclideanDistance::new().to_enum())), max_frontier_size:None}
 	} else {
-		OwningPyHNSW{index:IndexOneOf::B(index.into_capped(max_frontier_size.unwrap())), max_frontier_size:max_frontier_size}
+		OwningPyHNSW{index:IndexOneOf::B(index.into_capped(max_frontier_size.unwrap()).with_distance(SquaredEuclideanDistance::new().to_enum())), max_frontier_size:max_frontier_size}
 	}
 }
 #[pyfunction]
@@ -764,16 +1363,20 @@ pub fn load_hnswlib(file: &str, max_frontier_size: Option<usize>) -> OwningPyHNS
 pub fn load_hnswlib_fat(file: &str, max_frontier_size: Option<usize>) -> OwningPyFatHNSW {
 	let index = crate::hnsw::load_hnswlib_fat(file);
 	if max_frontier_size.is_none() {
-		OwningPyFatHNSW{index:IndexOneOf::A(index), max_frontier_size:None}
+		OwningPyFatHNSW{index:IndexOneOf::A(index.with_distance(SquaredEuclideanDistance::new().to_enum())), max_frontier_size:None}
 	} else {
-		OwningPyFatHNSW{index:IndexOneOf::B(index.into_capped(max_frontier_size.unwrap())), max_frontier_size:max_frontier_size}
+		OwningPyFatHNSW{index:IndexOneOf::B(index.into_capped(max_frontier_size.unwrap()).with_distance(SquaredEuclideanDistance::new().to_enum())), max_frontier_size:max_frontier_size}
 	}
 }
 
+#[cfg(feature="pyprec16")]
+type DendrogramResult = (Vec<(usize, usize, f32, usize)>, Vec<f32>);
+#[cfg(not(feature="pyprec16"))]
+type DendrogramResult = (Vec<(usize, usize, PyFloat, usize)>, Vec<PyFloat>);
 #[pyfunction]
 #[pyo3(signature = (data, min_pts, expand=None, symmetric_expand=None, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None))]
 pub fn hnsw_based_dendrogram<'py>(
-	data: Bound<'py, PyArray2<f32>>,
+	data: Bound<'py, PyArray2<PyFloat>>,
 	min_pts: usize,
 	expand: Option<bool>,
 	symmetric_expand: Option<bool>,
@@ -789,7 +1392,7 @@ pub fn hnsw_based_dendrogram<'py>(
 	post_prune_heuristic: Option<bool>,
 	insert_minibatch_size: Option<usize>,
 	n_rounds: Option<usize>,
-) -> (Vec<(usize, usize, f32, usize)>, Vec<f32>) {
+) -> DendrogramResult {
 	let hnsw_params = HNSWParams::new()
 	.maybe_with_higher_max_degree(higher_max_degree)
 	.maybe_with_lowest_max_degree(lowest_max_degree)
@@ -805,16 +1408,28 @@ pub fn hnsw_based_dendrogram<'py>(
 	.maybe_with_n_rounds(n_rounds)
 	;
 	unsafe {
-		let mut result = crate::cluster::hnsw_based_dendrogram::<f32,usize,_,_>(
+		let result = crate::cluster::hnsw_based_dendrogram::<PyFloat,usize,_,_>(
 			&arrview2_py_to_rust(data.as_array()),
-			SquaredEuclideanDistance::new(),
+			graphidx::measures::SquaredEuclideanDistance::new(),
 			min_pts,
 			expand.unwrap_or(true),
 			symmetric_expand.unwrap_or(false),
 			hnsw_params,
 		);
-		result.0.iter_mut().for_each(|(_,_,d,_)| *d = d.max(0.0).sqrt());
-		result.1.iter_mut().for_each(|d| *d = d.max(0.0).sqrt());
+		#[cfg(feature="pyprec16")]
+		let result = {
+			let (part1, part2) = result;
+			let part1 = part1.into_iter().map(|(a,b,d,size)| (a,b,d.max(PyFloat::ZERO).to_f32().sqrt(), size)).collect();
+			let part2 = part2.into_iter().map(|d| d.max(PyFloat::ZERO).to_f32().sqrt()).collect();
+			(part1, part2)
+		};
+		#[cfg(not(feature="pyprec16"))]
+		let result = {
+			let mut result = result;
+			result.0.iter_mut().for_each(|(_,_,d,_)| *d = d.max(PyFloat::ZERO).sqrt());
+			result.1.iter_mut().for_each(|d| *d = d.max(PyFloat::ZERO).sqrt());
+			result
+		};
 		result
 	}
 }
@@ -822,7 +1437,7 @@ pub fn hnsw_based_dendrogram<'py>(
 #[pyfunction]
 #[pyo3(signature = (data, min_pts, self_join_neighbors, query_max_heap_size, expand=None, symmetric_expand=None, higher_max_degree=None, lowest_max_degree=None, max_layers=None, n_parallel_burnin=None, max_build_heap_size=None, max_build_frontier_size=None, level_norm_param_override=None, insert_heuristic=None, insert_heuristic_extend=None, post_prune_heuristic=None, insert_minibatch_size=None, n_rounds=None, query_local=false))]
 pub fn hnsw_based_dendrogram_self_joined<'py>(
-	data: Bound<'py, PyArray2<f32>>,
+	data: Bound<'py, PyArray2<PyFloat>>,
 	min_pts: usize,
 	self_join_neighbors: usize,
 	query_max_heap_size: usize,
@@ -841,7 +1456,7 @@ pub fn hnsw_based_dendrogram_self_joined<'py>(
 	insert_minibatch_size: Option<usize>,
 	n_rounds: Option<usize>,
 	query_local: Option<bool>,
-) -> (Vec<(usize, usize, f32, usize)>, Vec<f32>) {
+) -> DendrogramResult {
 	let hnsw_params = HNSWParams::new()
 	.maybe_with_higher_max_degree(higher_max_degree)
 	.maybe_with_lowest_max_degree(lowest_max_degree)
@@ -857,9 +1472,9 @@ pub fn hnsw_based_dendrogram_self_joined<'py>(
 	.maybe_with_n_rounds(n_rounds)
 	;
 	unsafe {
-		let mut result = crate::cluster::hnsw_based_dendrogram_self_joined::<f32,usize,_,_>(
+		let result = crate::cluster::hnsw_based_dendrogram_self_joined::<PyFloat,usize,_,_>(
 			&arrview2_py_to_rust(data.as_array()),
-			SquaredEuclideanDistance::new(),
+			graphidx::measures::SquaredEuclideanDistance::new(),
 			min_pts,
 			expand.unwrap_or(true),
 			symmetric_expand.unwrap_or(false),
@@ -868,25 +1483,59 @@ pub fn hnsw_based_dendrogram_self_joined<'py>(
 			query_max_heap_size,
 			query_local.unwrap_or(false),
 		);
-		result.0.iter_mut().for_each(|(_,_,d,_)| *d = d.max(0.0).sqrt());
-		result.1.iter_mut().for_each(|d| *d = d.max(0.0).sqrt());
+		#[cfg(feature="pyprec16")]
+		let result = {
+			let (part1, part2) = result;
+			let part1 = part1.into_iter().map(|(a,b,d,size)| (a,b,d.max(PyFloat::ZERO).to_f32().sqrt(), size)).collect();
+			let part2 = part2.into_iter().map(|d| d.max(PyFloat::ZERO).to_f32().sqrt()).collect();
+			(part1, part2)
+		};
+		#[cfg(not(feature="pyprec16"))]
+		let result = {
+			let mut result = result;
+			result.0.iter_mut().for_each(|(_,_,d,_)| *d = d.max(PyFloat::ZERO).sqrt());
+			result.1.iter_mut().for_each(|d| *d = d.max(PyFloat::ZERO).sqrt());
+			result
+		};
 		result
 	}
 }
 
+
+
+
+macro_rules! add_module_parts {
+	($module: ident, classes = [$($name: ident),*$(,)*]$(,)?) => {
+		$($module.add_class::<$name>()?;)*
+	};
+	($module: ident, functions = [$($name: ident),*$(,)*]$(,)?) => {
+		$($module.add_function(wrap_pyfunction!($name, $module)?)?;)*
+	};
+	(
+		$module: ident,
+		$($label: ident = [$($name: ident),*$(,)?]),*
+		$(,)?
+	) => {
+		$(add_module_parts!($module, $label = [$($name,)*]);)*
+	};
+}
 #[pymodule(name="graphidxbaselines")]
-fn hnsw(m: &Bound<'_, PyModule>) -> PyResult<()> {
-	m.add_class::<PyHNSW>()?;
-	m.add_class::<PyFatHNSW>()?;
-	m.add_class::<OwningPyHNSW>()?;
-	m.add_class::<OwningPyFatHNSW>()?;
-	m.add_class::<PySENHNSW>()?;
-	m.add_class::<PyRNNDescent>()?;
-	m.add_class::<PySENDescent>()?;
-	m.add_function(wrap_pyfunction!(load_hnswlib, m)?)?;
-	m.add_function(wrap_pyfunction!(load_hnswlib_fat, m)?)?;
-	m.add_function(wrap_pyfunction!(hnsw_based_dendrogram, m)?)?;
-	m.add_function(wrap_pyfunction!(hnsw_based_dendrogram_self_joined, m)?)?;
+fn graphidxbaselines(m: &Bound<'_, PyModule>) -> PyResult<()> {
+	add_module_parts!(
+		m,
+		classes = [
+			PyHNSW,PySENHNSW,SparsePyHNSW,
+			PyFatHNSW,OwningPyHNSW,OwningPyFatHNSW,
+			PyRNNDescent,PySENDescent,
+			DistanceEnum,
+		],
+		functions = [
+			load_hnswlib,load_hnswlib_fat,
+			hnsw_based_dendrogram,hnsw_based_dendrogram_self_joined,
+			ref_bits,prec_bits,
+		]
+	);
+	add_distance_wrappers_to_module!(m);
 	Ok(())
 }
 

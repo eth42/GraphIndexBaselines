@@ -29,7 +29,7 @@ rayon = "1.7.0"
 half = {version="2.2.1", features=["num-traits"]}
 foldhash = "0.1.4"
 pyo3 = { version = "0.23.4", features = ["extension-module","multiple-pymethods"], optional = true }
-numpy = { version = "0.23.0", optional = true}
+numpy = { version = "0.23.0", optional = true, features = ["half"]}
 
 [dev-dependencies]
 pyo3 = { version = "0.23.4", features = ["multiple-pymethods"] }
@@ -40,6 +40,14 @@ numpy = { version = "0.23.0" }
 default = ["python"]
 python = ["pyo3", "numpy"]
 hdf5 = ["dep:hdf5","graphidx/hdf5"]
+pyprec16 = []
+pyprec32 = []
+pyprec64 = []
+pyprec128 = []
+pyref16 = []
+pyref32 = []
+pyref64 = []
+pyref128 = []
 
 [profile.release]
 # features = ["python"]

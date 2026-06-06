@@ -165,7 +165,7 @@ fn make_greedy_index<
 >(graphs: Vec<G>, local_layer_ids: Vec<Vec<R>>, global_layer_ids: Vec<Vec<R>>, mat: M, dist: Dist, higher_level_max_heap_size: usize) -> GreedyLayeredGraphIndex<R, F, Dist, M, DirLoLGraph<R>> {
 	GreedyLayeredGraphIndex::new(
 		mat,
-		graphs.iter().map(|g|g.as_dir_lol_graph()).collect(),
+		graphs.into_iter().map(|g|g.as_dir_lol_graph()).collect(),
 		local_layer_ids,
 		global_layer_ids,
 		dist,
